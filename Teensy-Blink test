@@ -1,0 +1,13 @@
+// SIMPLEST BLINK code - TEENSY 4.1
+// Using pin 13 (standard LED pin from your pinout diagram)
+
+void setup() {
+  pinMode(13, OUTPUT);     // Pin 13 from your pinout diagram
+}
+
+void loop() {
+  digitalWrite(13, HIGH);  // LED ON
+  delay(10);              // Wait 0.5 seconds
+  digitalWrite(13, LOW);   // LED OFF  
+  delay(50);              // Wait 0.5 seconds
+}
