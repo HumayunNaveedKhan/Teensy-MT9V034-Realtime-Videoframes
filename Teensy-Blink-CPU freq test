@@ -1,0 +1,48 @@
+// Teensy 4.1 Clock Speed Check
+// This sketch prints the current CPU clock speed
+// Uses the onboard LED to indicate activity
+// No external LEDs required
+
+const int ONBOARD_LED = 13;
+
+void setup() {
+  Serial.begin(115200);  // High baud rate for fast output
+  while (!Serial) {
+    // Wait for serial monitor to open
+  }
+
+  pinMode(ONBOARD_LED, OUTPUT);  // Initialize onboard LED
+  
+  // Blink onboard LED to show startup
+  digitalWrite(ONBOARD_LED, HIGH);
+  delay(10);
+  digitalWrite(ONBOARD_LED, LOW);
+  delay(10);
+
+  // Print CPU frequency (F_CPU is compile-time defined)
+  // Set clock speed in Arduino IDE under Tools > CPU Speed > 600 MHz for max
+  Serial.print("Teensy 4.1 CPU Clock Speed Check Started");
+  Serial.print("Current CPU Frequency: ");
+  Serial.print(F_CPU / 1000000);
+  Serial.println(" MHz");
+
+  // Note: To ensure maximum speed, select 600 MHz (or higher for overclock) in Arduino IDE
+  // F_CPU reflects the selected speed.
+  // For runtime setting (advanced), you can use: 
+  // extern void set_arm_clock(uint32_t frequency);
+  // set_arm_clock(600000000); // Set to 600 MHz
+  // But typically not needed if set in IDE.
+}
+
+void loop() {
+  // Blink onboard LED in loop to show it's running
+  digitalWrite(ONBOARD_LED, HIGH);
+  delay(500);
+  digitalWrite(ONBOARD_LED, LOW);
+  delay(500);
+
+  // Optionally re-print clock speed
+  Serial.print("CPU Frequency still: ");
+  Serial.print(F_CPU / 10000000);
+  Serial.println(" MHz");
+}
