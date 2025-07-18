@@ -1,0 +1,240 @@
+/*
+ * Adapted for Teensy 4.1 from original Teensy 3.6 code.
+ * Uses polling for pixel clock and fast GPIO read for 10-bit parallel data.
+ * Configured for one MT9V034 camera.
+ * Data pins mapped to GPIO2 bits 0-9 for fast read using GPIO2_PSR.
+ * SYSCLK generated at 13.3MHz, but MT9V034 supports up to 26.6MHz—adjust if needed.
+ * I2C using standard Wire library.
+ * mt9v034 class implemented based on datasheet registers.
+ * Note: For higher performance and true realtime at full speed, consider using FlexIO with DMA (see PJRC forums or mjs513/Teensy_Camera library for examples).
+ * If polling is too slow, port to FlexIO parallel input.
+ */
+
+#include <Wire.h>
+
+#define STANDBY     0
+#define SYSCLK      3   // PWM pin for clock output
+#define EXPOSURE    1
+#define STFRM_OUT   4
+#define STLN_OUT1   5
+#define LNVAL1      14
+#define FRVAL1      15
+#define PIXCLK1     24
+
+#define MAX_IMAGE_WIDTH  752
+#define MAX_IMAGE_HEIGHT 480
+
+#define N_PIXELS  (MAX_IMAGE_WIDTH - 1)
+
+uint16_t exposure_us = 10000;   // up to 16383 us
+uint8_t analogGain = 16;  // 16 - 64 (scaled: 16=1x, 32=2x, 64=4x)
+uint8_t digitalGain = 4;  // 0 - 15
+uint16_t n_lines = MAX_IMAGE_HEIGHT;
+bool send_picture_data = false;
+
+class mt9v034 {
+private:
+  TwoWire *wire;
+  uint8_t addr;
+  void write(uint8_t reg, uint16_t val) {
+    wire->beginTransmission(addr);
+    wire->write(reg);
+    wire->write(val >> 8);
+    wire->write(val & 0xFF);
+    wire->endTransmission();
+  }
+public:
+  mt9v034(TwoWire *w, uint8_t a) : wire(w), addr(a) {}
+  void initialize() {
+    write(0x0C, 0x0001); // Soft reset
+    delay(1);
+    write(0x0C, 0x0000);
+    // Chip control: Slave mode, progressive, simultaneous
+    write(0x07, 0x0181 | 0x0001); // Bit 0=1 for slave mode
+    // Recommended settings from datasheet
+    write(0x20, 0x03C7);
+    write(0x24, 0x001B);
+    write(0x2B, 0x0003);
+    write(0x2F, 0x0003);
+    // Window control (752x480)
+    write(0x01, 0x0006); // Column start
+    write(0x02, 0x0001); // Row start
+    write(0x03, 0x01DF); // Row size (479 + 1 = 480)
+    write(0x04, 0x02F8); // Column size (752)
+    write(0x05, 0x002B); // Horiz blanking
+    write(0x06, 0x0003); // Vert blanking
+    // Other defaults as per datasheet
+  }
+  void setAGC(bool enable) {
+    uint16_t val = 0x0000; // Disable AGC/AEC
+    if (enable) val |= (1 << 1); // Enable AGC for context A
+    write(0xAF, val);
+  }
+  void setCompanding(bool enable) {
+    uint16_t val = 0x0000;
+    if (enable) val |= (1 << 2); // Enable ADC companding (12 to 10 bit)
+    write(0x1C, val);
+  }
+  void setAnalogGain(uint8_t gain) {
+    // Gain = gain / 16.0 (16=1x, 64=4x)
+    write(0x35, gain); // Context A analog gain
+  }
+  void setDigitalGain(uint8_t gain) {
+    // Simple global digital gain (assuming single register; adjust if tiled)
+    write(0xA5, gain); // HDR digital gain or similar; may need adjustment per datasheet
+  }
+};
+
+mt9v034 cam1(&Wire, 0x90 >> 1); // 0x48; change to 0xB0>>1 if needed
+
+// Data pins mapped to GPIO2 bits 0-9 (FlexIO2:0-9 pins for potential future upgrade)
+const uint8_t data_pins[10] = {10, 11, 12, 13, 32, 33, 9, 8, 7, 6}; // D0 to D9
+
+void setup() {
+  // Enable fast GPIO for GPIO2
+  IOMUXC_GPR_GPR27 = 0xFFFFFFFF;
+  GPIO2_GDIR = 0; // All inputs
+
+  // Configure data pins as inputs
+  ConfigDataPins();
+
+  // Setup SYSCLK to 13.3MHz (can increase to 26.6MHz if stable)
+  pinMode(SYSCLK, OUTPUT);
+  analogWriteFrequency(SYSCLK, 13300000);
+  analogWrite(SYSCLK, 128); // 50% duty cycle
+
+  pinMode(STANDBY, OUTPUT);
+  digitalWrite(STANDBY, LOW);
+
+  // Setup I2C
+  Wire.begin();
+  Wire.setClock(100000);
+
+  // Configure camera
+  cam1.initialize();
+  cam1.setAGC(false);
+  cam1.setCompanding(true);
+
+  pinMode(LNVAL1, INPUT);
+  pinMode(FRVAL1, INPUT);
+  pinMode(PIXCLK1, INPUT);
+
+  pinMode(EXPOSURE, OUTPUT);
+  pinMode(STFRM_OUT, OUTPUT);
+  pinMode(STLN_OUT1, OUTPUT);
+
+  Serial.begin(9600); // USB is high-speed on Teensy 4.1
+
+  delay(5000);
+}
+
+void loop() {
+  uint16_t ln_cnt = 0;
+  uint16_t nv_cnt = 0;
+  uint16_t zr_cnt = 0;
+
+  uint16_t a[MAX_IMAGE_WIDTH];
+
+  static bool second_frame = 0;
+
+  PulsePin(EXPOSURE, 50);
+  delayMicroseconds(exposure_us);
+  PulsePin(STFRM_OUT, 50);
+
+  for (int ln = 0; ln < 530; ln++) { // min 525 lines, including blanking
+    PulsePin(STLN_OUT1, 50);
+    if (ReadCameraLine(a, MAX_IMAGE_WIDTH)) {
+      // Check last data point for valid markers (adjust if needed)
+      if ((a[0] >> 10) != 0x3) zr_cnt++;
+      else if ((ln_cnt >= MAX_IMAGE_HEIGHT / 2 - n_lines / 2) &&
+               (ln_cnt < MAX_IMAGE_HEIGHT / 2 + n_lines / 2) && send_picture_data && second_frame) {
+        SendLine(ln_cnt, a, MAX_IMAGE_WIDTH);
+      }
+      ln_cnt++;
+    } else {
+      nv_cnt++;
+    }
+  }
+
+  second_frame = !second_frame;
+
+  while (Serial.available()) {
+    uint8_t buf[3];
+    for (int i = 0; i < 3; i++) buf[i] = Serial.read();
+
+    switch (buf[0]) {
+      case 'E': exposure_us = (buf[1] << 8) | buf[2]; break;
+      case 'A': analogGain = buf[2]; cam1.setAnalogGain(analogGain); break;
+      case 'D': digitalGain = buf[2]; cam1.setDigitalGain(digitalGain); break;
+      case 'N': n_lines = (buf[1] << 8) | buf[2]; break;
+      case 'P': send_picture_data = buf[2] & 0x01; break;
+      default: break;
+    }
+  }
+
+  if (!Serial.dtr()) send_picture_data = false;
+}
+
+void SendLine(uint16_t line, uint16_t *data, uint16_t dataSize) {
+  uint8_t *packed = new uint8_t[dataSize + 2];
+
+  Pack8bits(packed + 2, data, dataSize);
+  packed[0] = line >> 8;
+  packed[1] = line;
+  Serial.write(packed, dataSize + 2);
+  Serial.send_now();
+
+  delete[] packed;
+}
+
+void Pack8bits(uint8_t *dstByte, uint16_t *srcWord, size_t srcLength) {
+  for (size_t i = 0; i < srcLength; i++) {
+    dstByte[i] = srcWord[i] >> 2; // Shift 10-bit to 8-bit
+  }
+}
+
+void PulsePin(int pin, uint32_t cnt) {
+  digitalWriteFast(pin, 1);
+  CountPixclks(cnt);
+  digitalWriteFast(pin, 0);
+}
+
+void CountPixclks(uint32_t cnt) {
+  while (cnt != 0) {
+    if (digitalReadFast(PIXCLK1)) cnt--;
+  }
+}
+
+bool ReadCameraLine(uint16_t *a, uint16_t px) {
+  px -= 2;
+
+  noInterrupts();
+
+  int cnt = 820; // PIXCLKs between STLN_OUT1 pulses
+  while (!digitalReadFast(LNVAL1)) {
+    if (digitalReadFast(PIXCLK1)) {
+      if (--cnt == 0) {
+        interrupts();
+        return false;
+      }
+    }
+  }
+
+  // Capture one line of data
+  while (1) {
+    if (!digitalReadFast(PIXCLK1)) {
+      uint16_t d1 = GPIO2_PSR & 0x3FF; // Read 10 bits from GPIO2
+      a[px] = d1;
+      if (px-- == 0) break;
+    }
+  }
+
+  interrupts();
+  return true;
+}
+
+void ConfigDataPins(void) {
+  for (uint8_t i = 0; i < 10; i++) {
+    pinMode(data_pins[i], INPUT);
+  }
+}
