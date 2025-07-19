@@ -1,0 +1,312 @@
+/*
+ * Adapted for Teensy 4.1 + ATK-MC9V034-V1.5 (master mode, single camera, 8-bit data).
+ * Polls VSYNC/HREF/PCLK for frame capture.
+ * Streams 8-bit grayscale lines over USB Serial.
+ * Use PC Python script to view.
+ * For faster capture, add DMA/FlexIO (see PJRC forums).
+ * 
+ * Debug Updates for HREF Issues:
+ * - Manual exposure set (~10ms shutter).
+ * - EXP pulse if defined (e.g., for manual trigger).
+ * - HREF invert option (#define INVERT_HREF).
+ * - Exposure rows read (0x0B – >0 = integrating).
+ * - FPS estimate.
+ * - Serial Plotter: Avg brightness (line1), PCLK MHz (line2).
+ * - More timeout prints.
+ */
+
+#define INVERT_HREF  // Uncomment to wait for HREF low
+#define EXP_PIN 1  // Uncomment and set to Teensy pin connected to EXP (pulses high for 10us)
+
+#include <Wire.h>  // Use Wire2 for I2C
+
+#define LNVAL1      23  // HREF (line valid)
+#define FRVAL1      26  // VSYNC (frame valid)
+#define PIXCLK1     22  // PCLK
+
+#define MAX_IMAGE_WIDTH  752
+#define MAX_IMAGE_HEIGHT 480
+#define SIGNAL_TIMEOUT_MS 5000  // Timeout for VSYNC/HREF
+
+uint8_t analogGain = 16;  // 16-64 (1x-4x)
+uint8_t digitalGain = 4;  // 0-15
+uint16_t n_lines = MAX_IMAGE_HEIGHT;
+bool send_picture_data = true;  // Default true
+
+unsigned long frame_count = 0;
+unsigned long last_frame_time = 0;
+
+class mt9v034 {
+private:
+  TwoWire *wire;
+  uint8_t addr;
+  uint8_t write(uint8_t reg, uint16_t val) {
+    wire->beginTransmission(addr);
+    wire->write(reg);
+    wire->write(val >> 8);
+    wire->write(val & 0xFF);
+    return wire->endTransmission();
+  }
+  uint16_t read(uint8_t reg) {
+    wire->beginTransmission(addr);
+    wire->write(reg);
+    wire->endTransmission(false);
+    wire->requestFrom(addr, (uint8_t)2);
+    uint16_t val = wire->read() << 8;
+    val |= wire->read();
+    return val;
+  }
+public:
+  mt9v034(TwoWire *w, uint8_t a) : wire(w), addr(a) {}
+  uint16_t getChipID() {
+    return read(0x00);
+  }
+  uint16_t getExposureRows() {
+    return read(0x0B);
+  }
+  bool setManualExposure(uint16_t rows) {  // Shutter width lower (0x09)
+    if (write(0x09, rows) != 0) return false;
+    if (write(0x0A, 0x0000) != 0) return false; // Upper = 0 for simple
+    return true;
+  }
+  bool initialize() {
+    if (write(0x0C, 0x0001) != 0) return false; // Soft reset
+    delay(1);
+    if (write(0x0C, 0x0000) != 0) return false;
+    if (write(0x07, 0x0180) != 0) return false; // Master mode
+    if (write(0x20, 0x03C7) != 0) return false;
+    if (write(0x24, 0x001B) != 0) return false;
+    if (write(0x2B, 0x0003) != 0) return false;
+    if (write(0x2F, 0x0003) != 0) return false;
+    if (write(0x01, 0x0006) != 0) return false; // Column start
+    if (write(0x02, 0x0001) != 0) return false; // Row start
+    if (write(0x03, 0x01DF) != 0) return false; // Row size
+    if (write(0x04, 0x02F8) != 0) return false; // Column size
+    if (write(0x05, 0x002B) != 0) return false; // Horiz blanking (increase if needed)
+    if (write(0x06, 0x0003) != 0) return false; // Vert blanking
+    return true;
+  }
+  bool setAGC(bool enable) {
+    uint16_t val = enable ? 0x0003 : 0x0000;
+    return (write(0xAF, val) == 0);
+  }
+  bool setCompanding(bool enable) {
+    uint16_t val = enable ? (1 << 2) : 0x0000;
+    return (write(0x1C, val) == 0);
+  }
+  bool setAnalogGain(uint8_t gain) {
+    return (write(0x35, gain) == 0);
+  }
+  bool setDigitalGain(uint8_t gain) {
+    return (write(0xA5, gain) == 0);
+  }
+};
+
+mt9v034 cam1(&Wire2, 0x48);
+
+const uint8_t data_pins[8] = {17, 16, 15, 14, 19, 18, 21, 20};
+
+void setup() {
+  IOMUXC_GPR_GPR27 = 0xFFFFFFFF;
+  GPIO6_GDIR = 0;
+
+  ConfigDataPins();
+
+  pinMode(LNVAL1, INPUT);
+  pinMode(FRVAL1, INPUT);
+  pinMode(PIXCLK1, INPUT);
+#ifdef EXP_PIN
+  pinMode(EXP_PIN, OUTPUT);
+  digitalWrite(EXP_PIN, LOW);
+#endif
+
+  Serial.begin(115200);
+
+  Wire2.begin();
+  Wire2.setClock(100000);
+
+  Serial.println("Starting camera initialization...");
+
+  uint16_t chipID = cam1.getChipID();
+  Serial.print("DEBUG: Chip ID: 0x");
+  Serial.println(chipID, HEX);
+  if (chipID == 0x1324) {
+    Serial.println("Chip ID matches.");
+  } else {
+    Serial.println("ERROR: ID mismatch (expected 0x1324).");
+  }
+
+  if (cam1.initialize()) {
+    Serial.println("Registers initialized.");
+  } else {
+    Serial.println("ERROR: Init failed.");
+  }
+
+  if (cam1.setAGC(true)) {  // Auto first, then manual override
+    Serial.println("AGC/AEC set.");
+  } else {
+    Serial.println("ERROR: AGC failed.");
+  }
+
+  if (cam1.setManualExposure(1000)) {  // ~10ms exposure (adjust rows based on clock: rows = time_ms * row_time_us / 1000)
+    Serial.println("Manual exposure set (~10ms).");
+  } else {
+    Serial.println("ERROR: Manual exposure failed.");
+  }
+
+  if (cam1.setCompanding(true)) {
+    Serial.println("Companding set.");
+  } else {
+    Serial.println("ERROR: Companding failed.");
+  }
+
+  delay(5000);
+  Serial.println("ATK-MC9V034 Started - Waiting for frames...");
+}
+
+void loop() {
+  uint16_t ln_cnt = 0;
+  uint32_t brightness_sum = 0;
+
+  uint8_t a[MAX_IMAGE_WIDTH];
+
+#ifdef EXP_PIN
+  digitalWrite(EXP_PIN, HIGH);
+  delayMicroseconds(10);  // Short pulse for trigger
+  digitalWrite(EXP_PIN, LOW);
+  Serial.println("DEBUG: EXP pulsed.");
+#endif
+
+  unsigned long startTime = millis();
+  while (digitalReadFast(FRVAL1) == LOW && millis() - startTime < SIGNAL_TIMEOUT_MS);
+  if (millis() - startTime >= SIGNAL_TIMEOUT_MS) {
+    Serial.println("ERROR: VSYNC timeout.");
+    printSignals();
+    delay(1000);
+    return;
+  }
+  Serial.println("DEBUG: Frame start detected.");
+
+  uint32_t pclk_count = 0;
+  startTime = millis();
+  while (millis() - startTime < 1) {
+    if (digitalReadFast(PIXCLK1)) pclk_count++;
+  }
+  float pclk_mhz = pclk_count / 1000.0;
+  Serial.print("DEBUG: PCLK freq ~");
+  Serial.print(pclk_mhz);
+  Serial.println(" MHz.");
+
+  for (int ln = 0; ln < MAX_IMAGE_HEIGHT; ln++) {
+    startTime = millis();
+    while (digitalReadFast(LNVAL1) == LOW && millis() - startTime < SIGNAL_TIMEOUT_MS);
+    if (millis() - startTime >= SIGNAL_TIMEOUT_MS) {
+      Serial.print("ERROR: HREF timeout on line ");
+      Serial.println(ln);
+      printSignals();
+      return;
+    }
+
+    if (ReadCameraLine(a, MAX_IMAGE_WIDTH)) {
+      Serial.print("DEBUG: Line ");
+      Serial.print(ln_cnt);
+      Serial.println(" captured.");
+
+      if (ln_cnt % 100 == 0) {
+        Serial.print("Sample pixels: ");
+        for (int i = 0; i < 5; i++) {
+          Serial.print(a[i]);
+          Serial.print(" ");
+        }
+        Serial.println();
+      }
+
+      for (int i = 0; i < MAX_IMAGE_WIDTH; i++) {
+        brightness_sum += a[i];
+      }
+
+      if ((ln_cnt >= MAX_IMAGE_HEIGHT / 2 - n_lines / 2) &&
+          (ln_cnt < MAX_IMAGE_HEIGHT / 2 + n_lines / 2) && send_picture_data) {
+        SendLine(ln_cnt, a, MAX_IMAGE_WIDTH);
+      }
+      ln_cnt++;
+    }
+
+    while (digitalReadFast(LNVAL1) == HIGH);
+  }
+
+  uint8_t avg_brightness = brightness_sum / (MAX_IMAGE_WIDTH * MAX_IMAGE_HEIGHT);
+  frame_count++;
+  float fps = 1000.0 / (millis() - last_frame_time);
+  last_frame_time = millis();
+  Serial.print(avg_brightness);  // Line 1 for Plotter
+  Serial.print(",");
+  Serial.println(pclk_mhz);  // Line 2 for Plotter
+
+  Serial.print("DEBUG: Frame ");
+  Serial.print(frame_count);
+  Serial.print(" complete. Lines: ");
+  Serial.print(ln_cnt);
+  Serial.print(". Avg brightness: ");
+  Serial.print(avg_brightness);
+  Serial.print(". FPS ~");
+  Serial.println(fps, 1);
+
+  uint16_t exp_rows = cam1.getExposureRows();
+  Serial.print("DEBUG: Exposure rows: ");
+  Serial.println(exp_rows);
+
+  while (Serial.available()) {
+    uint8_t buf[3];
+    for (int i = 0; i < 3; i++) buf[i] = Serial.read();
+    switch (buf[0]) {
+      case 'A': analogGain = buf[2]; cam1.setAnalogGain(analogGain); break;
+      case 'D': digitalGain = buf[2]; cam1.setDigitalGain(digitalGain); break;
+      case 'N': n_lines = (buf[1] << 8) | buf[2]; break;
+      case 'P': send_picture_data = buf[2] & 0x01; break;
+      default: break;
+    }
+  }
+
+  if (!Serial.dtr()) send_picture_data = false;
+}
+
+void printSignals() {
+  Serial.print("Current signals: VSYNC=");
+  Serial.print(digitalRead(FRVAL1));
+  Serial.print(", HREF=");
+  Serial.print(digitalRead(LNVAL1));
+  Serial.print(", PCLK=");
+  Serial.println(digitalRead(PIXCLK1));
+}
+
+void SendLine(uint16_t line, uint8_t *data, uint16_t dataSize) {
+  uint8_t *packed = new uint8_t[dataSize + 2];
+  memcpy(packed + 2, data, dataSize);
+  packed[0] = line >> 8;
+  packed[1] = line;
+  Serial.write(packed, dataSize + 2);
+  Serial.send_now();
+  delete[] packed;
+}
+
+bool ReadCameraLine(uint8_t *a, uint16_t px) {
+  px--;
+
+  noInterrupts();
+
+  for (uint16_t i = 0; i <= px; i++) {
+    while (digitalReadFast(PIXCLK1) == HIGH);
+    while (digitalReadFast(PIXCLK1) == LOW);
+    a[i] = GPIO6_PSR & 0xFF;
+  }
+
+  interrupts();
+  return true;
+}
+
+void ConfigDataPins(void) {
+  for (uint8_t i = 0; i < 8; i++) {
+    pinMode(data_pins[i], INPUT);
+  }
+}
