@@ -1,0 +1,53 @@
+import serial
+import cv2
+import numpy as np
+
+# Adjust 'COM3' to your Teensy's port (check Device Manager > Ports)
+ser = serial.Serial('COM10', 2000000, timeout=5)  # Increase timeout if needed for slower data
+
+width = 752
+height = 480
+line_size = width + 2  # 2-byte header + pixels
+frame_size = line_size * height  # Full frame bytes
+
+print("Script started. Waiting for data from Teensy...")
+print(f"Expected full frame size: {frame_size} bytes")
+
+while True:
+    try:
+        frame_data = b''
+        total_received = 0
+        while len(frame_data) < frame_size:
+            chunk = ser.read(frame_size - len(frame_data))
+            if len(chunk) == 0:
+                print("DEBUG: No data received in timeout - check if Teensy is sending (close Serial Monitor).")
+                break  # Exit inner loop to retry
+            frame_data += chunk
+            total_received += len(chunk)
+            print(f"DEBUG: Received chunk of {len(chunk)} bytes. Total so far: {total_received} / {frame_size}")
+        
+        if len(frame_data) == frame_size:
+            print("DEBUG: Full frame received! Processing image...")
+            img = np.zeros((height, width), dtype=np.uint8)
+            for row in range(height):
+                offset = row * line_size
+                # Skip 2-byte line header, use pixel data
+                img[row] = np.frombuffer(frame_data[offset + 2:offset + line_size], dtype=np.uint8)
+            
+            print("DEBUG: Image processed. Opening/Updating window...")
+            cv2.imshow('MT9V034 Video', img)
+            print("DEBUG: cv2.imshow called - window should appear/update now.")
+            
+            key = cv2.waitKey(1)
+            if key & 0xFF == ord('q'):
+                print("DEBUG: 'q' pressed - quitting.")
+                break
+        else:
+            print(f"DEBUG: Incomplete frame ({len(frame_data)} bytes) - retrying. Ensure Teensy is streaming full frames.")
+    
+    except Exception as e:
+        print(f"ERROR: Exception occurred - {e}. Check serial port or dependencies.")
+
+cv2.destroyAllWindows()
+ser.close()
+print("Script ended.")
