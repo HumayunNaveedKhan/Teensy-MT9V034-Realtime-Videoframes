@@ -1,0 +1,155 @@
+/*
+ * Final Working Code for Teensy 4.1 + ATK-MC9V034-V1.5 (master mode, single camera, 8-bit data).
+ * Polls VSYNC/HREF/PCLK for frame capture.
+ * Streams 8-bit grayscale lines over USB Serial at high baud for realtime.
+ * Reduced resolution for faster testing (376x240 - change back if needed).
+ * Removed heavy debug prints to avoid mixing with binary data (use #define DEBUG_MODE for logs).
+ * Manual exposure, higher baud, optional VSYNC/HREF invert.
+ * Unplug EXP if connected (not needed - tie to GND).
+ * Use Python script in VS Code for realtime video popup.
+ * 
+ * To use: Upload, close Serial Monitor, run Python - window pops with video.
+ */
+
+ //#define DEBUG_MODE  // Uncomment for Serial debug logs (slows stream - use for troubleshooting)
+//#define INVERT_VSYNC  // Uncomment if VSYNC inverted
+#define INVERT_HREF  // Uncomment if HREF inverted
+
+#include <Wire.h>  // Use Wire2 for I2C
+
+#define LNVAL1      23  // HREF (line valid)
+#define FRVAL1      26  // VSYNC (frame valid)
+#define PIXCLK1     22  // PCLK
+
+#define MAX_IMAGE_WIDTH  376  // Reduced for speed (original 752)
+#define MAX_IMAGE_HEIGHT 240  // Reduced for speed (original 480)
+
+uint16_t n_lines = MAX_IMAGE_HEIGHT;
+bool send_picture_data = true;
+
+class mt9v034 {
+private:
+  TwoWire *wire;
+  uint8_t addr;
+  uint8_t write(uint8_t reg, uint16_t val) {
+    wire->beginTransmission(addr);
+    wire->write(reg);
+    wire->write(val >> 8);
+    wire->write(val & 0xFF);
+    return wire->endTransmission();
+  }
+public:
+  mt9v034(TwoWire *w, uint8_t a) : wire(w), addr(a) {}
+  bool initialize() {
+    write(0x0C, 0x0001); // Soft reset
+    delay(1);
+    write(0x0C, 0x0000);
+    write(0x07, 0x0180); // Master mode
+    write(0x20, 0x03C7);
+    write(0x24, 0x001B);
+    write(0x2B, 0x0003);
+    write(0x2F, 0x0003);
+    write(0x01, 0x0006); // Column start
+    write(0x02, 0x0001); // Row start
+    write(0x03, MAX_IMAGE_HEIGHT - 1); // Row size
+    write(0x04, MAX_IMAGE_WIDTH); // Column size
+    write(0x05, 0x0050); // Increased horiz blanking
+    write(0x06, 0x0010); // Increased vert blanking
+    return true;
+  }
+  void setAGC(bool enable) {
+    write(0xAF, enable ? 0x0003 : 0x0000);
+  }
+  void setCompanding(bool enable) {
+    write(0x1C, enable ? (1 << 2) : 0x0000);
+  }
+  void setManualExposure(uint16_t rows) {
+    write(0x09, rows); // Shutter width
+    write(0x0A, 0x0000);
+  }
+};
+
+mt9v034 cam1(&Wire2, 0x48);  // Change to 0x5C if needed
+
+const uint8_t data_pins[8] = {17, 16, 15, 14, 19, 18, 21, 20};
+
+void setup() {
+  IOMUXC_GPR_GPR27 = 0xFFFFFFFF;
+  GPIO6_GDIR = 0;
+
+  ConfigDataPins();
+
+  pinMode(LNVAL1, INPUT);
+  pinMode(FRVAL1, INPUT);
+  pinMode(PIXCLK1, INPUT);
+
+  Serial.begin(2000000);  // High baud for realtime stream
+
+  Wire2.begin();
+  Wire2.setClock(100000);
+
+  cam1.initialize();
+  cam1.setAGC(false);  // Manual for consistency
+  cam1.setManualExposure(2000);  // ~20ms exposure - adjust based on light
+  cam1.setCompanding(true);  // 8-bit mode
+
+  delay(2000);  // Startup delay
+#ifdef DEBUG_MODE
+  Serial.println("Camera ready - starting stream.");
+#endif
+}
+
+void loop() {
+  uint8_t a[MAX_IMAGE_WIDTH];
+
+  // Wait for VSYNC
+#ifdef INVERT_VSYNC
+  while (digitalReadFast(FRVAL1));
+#else
+  while (!digitalReadFast(FRVAL1));
+#endif
+
+  for (int ln = 0; ln < MAX_IMAGE_HEIGHT; ln++) {
+    // Wait for HREF
+#ifdef INVERT_HREF
+  while (digitalReadFast(LNVAL1));
+#else
+  while (!digitalReadFast(LNVAL1));
+#endif
+
+    ReadCameraLine(a, MAX_IMAGE_WIDTH);
+
+    if (send_picture_data) {
+      SendLine(ln, a, MAX_IMAGE_WIDTH);
+    }
+
+    // Wait for HREF end
+#ifdef INVERT_HREF
+  while (!digitalReadFast(LNVAL1));
+#else
+  while (digitalReadFast(LNVAL1));
+#endif
+  }
+}
+
+void SendLine(uint16_t line, uint8_t *data, uint16_t dataSize) {
+  uint8_t packed[dataSize + 2];
+  packed[0] = line >> 8;
+  packed[1] = line;
+  memcpy(packed + 2, data, dataSize);
+  Serial.write(packed, dataSize + 2);
+}
+
+void ReadCameraLine(uint8_t *a, uint16_t px) {
+  for (uint16_t i = 0; i < px; i++) {
+    while (!digitalReadFast(PIXCLK1));  // Wait rising edge
+    a[i] = GPIO6_PSR & 0xFF;
+    while (digitalReadFast(PIXCLK1));  // Wait falling
+  }
+}
+
+void ConfigDataPins(void) {
+  for (uint8_t i = 0; i < 8; i++) {
+    pinMode(data_pins[i], INPUT);
+  }
+}
